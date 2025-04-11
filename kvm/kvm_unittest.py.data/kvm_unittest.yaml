@@ -1,0 +1,32 @@
+qemu_binary:
+test: !mux
+  access:
+    test: access
+  vmexit_cpuid:
+    test: vmexit_cpuid
+  memory:
+    test: memory
+  apic-split_accelerated:
+    test: apic-split
+    mode: accelerated
+  apic-split_non_accelerated:
+    test: apic-split
+    mode: non-accelerated
+  ioapic-split_accelerated:
+    test: ioapic-split
+    mode: accelerated
+  ioapic-split_non_accelerated:
+    test: ioapic-split
+    mode: non-accelerated
+  x2apic_accelerated:
+    test: x2apic
+    mode: accelerated
+  x2apic_non_accelerated:
+    test: x2apic
+    mode: non-accelerated
+  xapic_accelerated:
+    test: xapic
+    mode: accelerated
+  xapic_non_accelerated:
+    test: xapic
+    mode: non-accelerated
