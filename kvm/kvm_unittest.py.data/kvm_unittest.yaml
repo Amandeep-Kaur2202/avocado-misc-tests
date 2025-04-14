@@ -1,0 +1,15 @@
+test: !mux
+  apic-split:
+    test: apic-split
+  ioapic-split:
+    test: ioapic-split
+  x2apic:
+    test: x2apic
+  xapic:
+    test: xapic
+mode: !mux
+  accelerated:
+    mode: accelerated
+  non-accelerated:
+    mode: non-accelerated
+  
