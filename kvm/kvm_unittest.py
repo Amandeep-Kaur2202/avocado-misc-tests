@@ -20,8 +20,86 @@ import os
 import shutil
 
 from avocado import Test
+from avocado.utils import dmesg
+from avocado.core.exceptions import TestSkipError
 from avocado.utils import git, build, process, genio
 from avocado.utils import cpu, linux_modules
+
+# Map CPU vendors to their corresponding KVM kernel modules and kernel config options
+KVM_MODULE_MAP = {
+    "amd": ("kvm_amd", "CONFIG_KVM_AMD"),
+    "intel": ("kvm_intel", "CONFIG_KVM_INTEL"),
+    # Add new vendors here if needed.
+}
+
+
+def detect_kvm_module():
+    """
+    Detect CPU vendor and return the KVM kernel module and kernel configuration symbol.
+    Returns:
+        tuple: (module_name, kernel_config_option)
+    Raises:
+        TestSkipError: If CPU vendor cannot be determined or no mapping exists.
+    """
+    try:
+        vendor = cpu.get_vendor()
+        if not vendor:
+            raise ValueError("Unable to determine CPU vendor.")
+        vendor = vendor.lower()
+        if vendor in KVM_MODULE_MAP:
+            return KVM_MODULE_MAP[vendor]
+        raise ValueError(f"No KVM module mapping for CPU vendor: {vendor}")
+    except Exception as e:
+        raise TestSkipError(f"Failed to detect KVM module: {e}") from e
+
+
+def capture_module_parameters(params_dir):
+    """
+    Capture current parameters of a loaded kernel module from sysfs.
+    Args:
+        params_dir (str): Path to the module's sysfs parameters directory.
+    Returns:
+        dict: Parameter names and their current values.
+    Raises:
+        TestSkipError: If parameters directory does not exist or reading fails.
+    """
+    if not os.path.exists(params_dir):
+        raise TestSkipError(f"Sysfs parameters directory not found: {params_dir}")
+
+    params = {}
+    for param in os.listdir(params_dir):
+        param_path = os.path.join(params_dir, param)
+        if os.path.isfile(param_path) and os.access(param_path, os.R_OK):
+            try:
+                # Assumes parameters are text files.
+                value = genio.read_file(param_path).rstrip("\n")
+                params[param] = value
+            except (OSError, IOError) as exc:
+                raise TestSkipError(
+                    f"Failed to read parameter '{param}': {exc}"
+                ) from exc
+
+    return params
+
+
+def verify_sysfs_param(file_path, expected_values):
+    """
+    Verify if a sysfs parameter file's value matches one of the expected values.
+    Args:
+        file_path (str): Path to the sysfs parameter file.
+        expected_values (tuple or list): Allowed values.
+    Returns:
+        bool: True if current value matches one of expected values, False otherwise.
+    """
+    if not os.path.exists(file_path):
+        return False
+
+    try:
+        current_value = genio.read_file(file_path).rstrip("\n")
+        return current_value in expected_values
+    except (OSError, IOError):
+        # Propagate exceptions for caller to handle.
+        raise
 
 
 # pylint: disable=too-many-instance-attributes
@@ -44,48 +122,58 @@ class KVMUnitTest(Test):
                 f"Invalid mode '{self.mode}', expected 'accelerated', 'non-accelerated', or empty"
             )
 
-        # Set custom QEMU binary in test environment if it exists, otherwise skip the test.
+        # Setup QEMU binary in test environment, if specified
         if self.qemu_binary:
             if os.path.exists(self.qemu_binary):
                 self.test_env["QEMU"] = self.qemu_binary
             else:
                 self.cancel(f"Custom QEMU binary not found: {self.qemu_binary}")
 
-        # Set accelerator in test environment if specified in parameters.
+        # Set accelerator in test environment, if specified in parameters.
         if self.accelerator:
             self.test_env["ACCEL"] = self.accelerator
 
-        # Detect, capture state, and configure the KVM module for the test environment.
-        self.detect_kvm_module()
+        # Detect KVM module and kernel config option
+        try:
+            self.kvm_module, self.config_option = detect_kvm_module()
+        except TestSkipError as e:
+            self.cancel(str(e))
+
+        self.file_path = (
+            f"/sys/module/{self.kvm_module}/parameters/{self.kvm_module_param}"
+        )
         self.capture_kvm_module_state()
         self.check_and_configure_kvm_module()
 
-        # Clone the KVM unit tests repository
+        # Clone the KVM unit tests repository, if needed
         if not os.path.isdir(self.kvm_tests_dir):
             git.get_repo(self.kvm_tests_repo, destination_dir=self.kvm_tests_dir)
 
         # Build the KVM unit tests repository
         os.chdir(self.kvm_tests_dir)
-        self.build_status = os.path.join(self.kvm_tests_dir, ".kvm_build_status")
-        rebuild_required = True
+        build_status = os.path.join(self.kvm_tests_dir, ".kvm_build_status")
+        rebuild_required = not (
+            os.path.exists(build_status)
+            and open(build_status, "r", encoding="utf-8").read().strip() == "success"
+        )
 
-        if os.path.exists(self.build_status):
-            with open(self.build_status, "r", encoding="utf-8") as f:
-                if f.read().strip() == "success":
-                    rebuild_required = False
-                    self.log.info("KVM unit test repository already built. Skipping rebuild.")
-                else:
-                    self.log.info("KVM unit test repository build failed. Rebuilding.")
-
-        if rebuild_required:
+        if not rebuild_required:
+            self.log.info("KVM unit test repository already built. Skipping rebuild.")
+        else:
+            self.log.info(
+                "KVM unit test repository build failed or not found. Rebuilding."
+            )
             try:
-                configure_cmd = f"./configure {self.configure_args}"
-                process.system(configure_cmd, ignore_status=False, shell=True)
+                process.system(
+                    f"./configure {self.configure_args}",
+                    ignore_status=False,
+                    shell=True,
+                )
                 build.make(self.kvm_tests_dir, extra_args=f"-j {os.cpu_count()}")
-                with open(self.build_status, "w", encoding="utf-8") as f:
+                with open(build_status, "w", encoding="utf-8") as f:
                     f.write("success")
             except Exception as err:
-                with open(self.build_status, "w", encoding="utf-8") as f:
+                with open(build_status, "w", encoding="utf-8") as f:
                     f.write("failed")
                 self.log.error("Failed to build kvm-unit-tests: %s", err)
                 raise
@@ -116,21 +204,9 @@ class KVMUnitTest(Test):
         self.kvm_module_param = self.params.get("kvm_module_param", default="avic")
         self.test_env = os.environ.copy()
         self.initial_kvm_params = {}
-        self.initial_dmesg = "dmesg_initial.txt"
-        self.final_dmesg = "dmesg_final.txt"
+        self.initial_dmesg = os.path.join(self.teststmpdir, "dmesg_initial.txt")
+        self.final_dmesg = os.path.join(self.teststmpdir, "dmesg_final.txt")
 
-    def detect_kvm_module(self):
-        """
-        Detects the CPU vendor and returns the appropriate KVM module and parameter.
-        Defaults to 'kvm_amd' for AMD CPUs and 'kvm_intel' for Intel CPUs.
-        """
-        vendor = cpu.get_vendor()
-        if "amd" in vendor:
-            self.kvm_module = "kvm_amd"
-        elif "intel" in vendor:
-            self.kvm_module = "kvm_intel"
-        else:
-            self.cancel(f"Unsupported CPU vendor: {vendor}")
 
     def capture_kvm_module_state(self):
         """
@@ -143,37 +219,26 @@ class KVMUnitTest(Test):
             return
 
         kvm_sysfs_param_dir = f"/sys/module/{self.kvm_module}/parameters"
-        if not os.path.exists(kvm_sysfs_param_dir):
-            self.cancel(
-                f"Unable to read parameters: sysfs path not found at {kvm_sysfs_param_dir}"
-            )
 
-        self.initial_kvm_params["__state__"] = "loaded"
-        self.log.info(
-            "Storing initial values for KVM module '%s' parameters.", self.kvm_module
-        )
-        for param_name in os.listdir(kvm_sysfs_param_dir):
-            param_path = os.path.join(kvm_sysfs_param_dir, param_name)
-            if os.path.isfile(param_path) and os.access(param_path, os.R_OK):
-                try:
-                    value = genio.read_file(param_path).rstrip("\n")
-                    self.initial_kvm_params[param_name] = value
-                except (OSError, IOError) as e:
-                    self.log.warn("Failed to read parameter '%s': %s", param_name, e)
+        try:
+            self.log.info(
+                "Storing initial values for KVM module '%s'.", self.kvm_module
+            )
+            self.initial_kvm_params = capture_module_parameters(kvm_sysfs_param_dir)
+            self.initial_kvm_params["__state__"] = "loaded"
+        except TestSkipError as e:
+            self.cancel(str(e))
 
     def check_and_configure_kvm_module(self):
         """
         Check if the specified kernel config "config_option" is builtin, module or not set.
-        - config_option: Kernel config to check (e.g., CONFIG_KVM_AMD or CONFIG_KVM_INTEL)
         """
-        config_option = f"CONFIG_{self.kvm_module.upper()}"
-        config_status = linux_modules.check_kernel_config(config_option)
-
+        config_status = linux_modules.check_kernel_config(self.config_option)
         if config_status == linux_modules.ModuleConfig.NOT_SET:
-            self.cancel(f"{config_option} is not set in the kernel configuration.")
+            self.cancel(f"{self.config_option} is not set in the kernel configuration.")
 
         if config_status == linux_modules.ModuleConfig.MODULE:
-            self.log.info("%s is a loadable kernel module.", config_option)
+            self.log.info("%s is a loadable kernel module.", self.config_option)
             self.configure_kvm_module()
             return
 
@@ -181,12 +246,12 @@ class KVMUnitTest(Test):
             config_status == linux_modules.ModuleConfig.BUILTIN
             and self.mode is not None
         ):
-            self.log.info("%s is built-in kernel module.", config_option)
+            self.log.info("%s is built-in kernel module.", self.config_option)
             expected_value = ("1", "Y") if self.mode == "accelerated" else ("0", "N")
 
-            if not self.verify_sysfs_param(expected_value):
+            if not verify_sysfs_param(self.file_path, expected_value):
                 self.cancel(
-                    f"Cannot modify kvm module parameters since {config_option} is built-in."
+                    f"Cannot modify kvm module parameters since {self.config_option} is built-in."
                 )
 
     def configure_kvm_module(self):
@@ -200,62 +265,58 @@ class KVMUnitTest(Test):
         if self.mode is None:
             if not linux_modules.module_is_loaded(self.kvm_module):
                 linux_modules.load_module(self.kvm_module)
-                return
             return
 
         if linux_modules.module_is_loaded(self.kvm_module):
             linux_modules.unload_module(self.kvm_module)
 
         if self.mode == "accelerated":
-            process.run(f"dmesg -T > {self.initial_dmesg}", shell=True, ignore_status=True)
+            process.run(
+                f"dmesg -T > {self.initial_dmesg}", shell=True, ignore_status=True
+            )
+            # Load module with parameter set to enable acceleration
             linux_modules.load_module(f"{self.kvm_module} {self.kvm_module_param}=1")
-            process.run(f"dmesg -T > {self.final_dmesg}", shell=True, ignore_status=True)
+            process.run(
+                f"dmesg -T > {self.final_dmesg}", shell=True, ignore_status=True
+            )
 
-            if not self.verify_sysfs_param(("1", "Y")):
+            if not verify_sysfs_param(self.file_path, ("1", "Y")):
                 self.cancel(
                     f"Failed to set '{self.kvm_module_param}=1' for module '{self.kvm_module}'."
                 )
             self.verify_kvm_dmesg()
 
         elif self.mode == "non-accelerated":
+            # Load module with parameter set to disable acceleration
             linux_modules.load_module(f"{self.kvm_module} {self.kvm_module_param}=0")
 
-            if not self.verify_sysfs_param(("0", "N")):
+            if not verify_sysfs_param(self.file_path, ("0", "N")):
                 self.cancel(
                     f"Failed to set '{self.kvm_module_param}=0' for module '{self.kvm_module}'."
                 )
-
-    def verify_sysfs_param(self, expected_value):
-        """
-        Check and validate kvm module against expected_value
-        expected_value: List of expected values for kvm module parameter
-        """
-        param_path = f"/sys/module/{self.kvm_module}/parameters/{self.kvm_module_param}"
-        if not os.path.exists(param_path):
-            self.cancel(f"Parameter sysfs path not found: {param_path}")
-
-        current_value = genio.read_file(param_path).rstrip("\n")
-        return current_value in expected_value
 
     def verify_kvm_dmesg(self):
         """
         Validates AVIC and x2AVIC enablement via dmesg logs.
         """
-        diff = process.run(
-            f"diff {self.initial_dmesg} {self.final_dmesg}",
-            ignore_status=True,
-            shell=True,
-        ).stdout_text
+        try:
+            diff, _ = dmesg.collect_dmesg_diff(self.initial_dmesg, self.final_dmesg)
+        except dmesg.DmesgError as e:
+            self.cancel(f"Dmesg diff failed: {e}")
 
         # Check for "AVIC enabled" in the dmesg diff (required for accelerated mode)
         if "AVIC enabled" not in diff:
             self.cancel("AVIC not enabled; cancelling accelerated mode tests.")
 
         # Check for "x2AVIC enabled" only if the test mode is 'x2apic'
-        if "x2apic" in self.tests.split(" ") and "x2AVIC enabled" not in diff:
-            self.tests = " ".join(test for test in self.tests.split(" ") if test != "x2apic")
+        if "x2apic" in self.tests.split() and "x2AVIC enabled" not in diff:
+            self.tests = " ".join(
+                test for test in self.tests.split() if test != "x2apic"
+            )
             if self.tests == "":
-                self.cancel("x2AVIC not enabled. Cancelling the 'x2apic' test in accelerated mode.")
+                self.cancel(
+                    "x2AVIC not enabled. Cancelling the 'x2apic' test in accelerated mode."
+                )
             self.log.warn("x2AVIC not enabled. Removing 'x2apic' from test list.")
 
     def test(self):
@@ -267,7 +328,7 @@ class KVMUnitTest(Test):
         failed_tests, skipped_tests, passed_tests = [], [], []
 
         try:
-            for test in self.tests.split(" "):
+            for test in self.tests.split():
                 result = process.run(
                     f"./run_tests.sh {test}",
                     shell=True,
@@ -276,6 +337,7 @@ class KVMUnitTest(Test):
                     env=self.test_env,
                 ).stdout_text
 
+                # Parse test outcome from stdout
                 if "FAIL" in result:
                     failed_tests.append(test)
                 elif "SKIP" in result:
@@ -283,28 +345,29 @@ class KVMUnitTest(Test):
                 elif "PASS" in result:
                     passed_tests.append(test)
 
-                log_path = f"logs/{test}.log"
+                # Copy respective test log to output directory and log its contents
+                log_path = os.path.join(self.kvm_tests_dir, "logs", f"{test}.log")
                 if os.path.exists(log_path):
                     shutil.copy(log_path, self.outputdir)
                     with open(log_path, "r", encoding="utf-8") as f:
-                        result = f.read()
-                        self.log.info("%s", result)
+                        self.log.info("%s", f.read())
 
-            for t, label in [
+            # Log summary of results
+            for test_list, label in [
                 (failed_tests, "failed"),
                 (skipped_tests, "skipped"),
                 (passed_tests, "passed"),
             ]:
-                if t:
-                    self.log.info("%d test(s) %s: %s.", len(t), label, t)
+                if test_list:
+                    self.log.info(
+                        "%d test(s) %s: %s.", len(test_list), label, test_list
+                    )
 
             if failed_tests:
-                self.fail(
-                    f"{len(failed_tests)} test(s) failed: {(failed_tests)}. Check logs for details."
-                )
+                self.fail(f"{len(failed_tests)} test(s) failed: {failed_tests}.")
 
         except process.CmdError as err:
-            self.fail(f"Test '{self.tests}' failed to execute: {err}")
+            self.fail(f"Test execution failed: {err}")
 
     def tearDown(self):
         """
@@ -314,9 +377,13 @@ class KVMUnitTest(Test):
             return
 
         self.log.info("Restoring the initial setup")
+
         if self.initial_kvm_params.get("__state__") == "unloaded":
+            # Unload the module if currently loaded, as it was initially unloaded
             linux_modules.unload_module(self.kvm_module)
+
         elif self.initial_kvm_params.get("__state__") == "loaded":
+            # Reload the module with original parameters
             param_args = " ".join(
                 f"{k}={v}"
                 for k, v in self.initial_kvm_params.items()
